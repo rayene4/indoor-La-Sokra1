@@ -2,9 +2,7 @@ import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { CalendarDays, Clock, User, Phone, CheckCircle, AlertCircle, Banknote, Loader2 } from 'lucide-react'
 import emailjs from '@emailjs/browser'
-import { collection, doc, getDocs, query, runTransaction, where } from 'firebase/firestore'
 import { EMAILJS_CONFIG } from '../../emailjs.config'
-import { db, isFirebaseConfigured } from '../../firebase'
 
 const timeSlots = [
   '09:00','10:30','12:00','13:30','15:00',
@@ -18,48 +16,63 @@ const courts = [
 
 type Status = 'idle' | 'loading' | 'success' | 'error' | 'taken'
 
+// ── LocalStorage helpers ──────────────────────────────────────────────────────
+const storageKey = (date: string, courtId: number) =>
+  `padel_bookings_${date}_court${courtId}`
+
+function getBookedSlots(date: string, courtId: number): string[] {
+  try {
+    const raw = localStorage.getItem(storageKey(date, courtId))
+    return raw ? (JSON.parse(raw) as string[]) : []
+  } catch {
+    return []
+  }
+}
+
+function addBookedSlot(date: string, courtId: number, time: string): void {
+  const existing = getBookedSlots(date, courtId)
+  if (!existing.includes(time)) {
+    localStorage.setItem(storageKey(date, courtId), JSON.stringify([...existing, time]))
+  }
+}
+
+function isSlotTaken(date: string, courtId: number, time: string): boolean {
+  return getBookedSlots(date, courtId).includes(time)
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 export default function Booking() {
   const [selectedTime, setSelectedTime] = useState('')
   const [selectedCourt, setSelectedCourt] = useState(0)
   const [form, setForm] = useState({ date: '', name: '', phone: '' })
   const [status, setStatus] = useState<Status>('idle')
   const [bookedSlots, setBookedSlots] = useState<string[]>([])
-  const [loadingSlots, setLoadingSlots] = useState(false)
 
   const isFormValid = form.name && form.phone && form.date && selectedTime && selectedCourt
 
-  // Fetch booked slots whenever date or court changes
+  // Reload booked slots from localStorage when date or court changes
   useEffect(() => {
-    if (!form.date || !selectedCourt || !isFirebaseConfigured || !db) {
+    if (!form.date || !selectedCourt) {
       setBookedSlots([])
       return
     }
-
-    const fetchBookedSlots = async () => {
-      setLoadingSlots(true)
-      try {
-        const q = query(
-          collection(db!, 'bookings'),
-          where('date', '==', form.date),
-          where('courtId', '==', selectedCourt),
-        )
-        const snapshot = await getDocs(q)
-        const booked = snapshot.docs.map(d => d.data().time as string)
-        setBookedSlots(booked)
-        if (booked.includes(selectedTime)) setSelectedTime('')
-      } catch (err) {
-        console.error('Firestore fetch error:', err)
-      } finally {
-        setLoadingSlots(false)
-      }
-    }
-
-    fetchBookedSlots()
+    const booked = getBookedSlots(form.date, selectedCourt)
+    setBookedSlots(booked)
+    if (booked.includes(selectedTime)) setSelectedTime('')
   }, [form.date, selectedCourt])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!isFormValid) return
+
+    // Double-check slot availability right before submitting
+    if (isSlotTaken(form.date, selectedCourt, selectedTime)) {
+      setBookedSlots(getBookedSlots(form.date, selectedCourt))
+      setSelectedTime('')
+      setStatus('taken')
+      setTimeout(() => setStatus('idle'), 5000)
+      return
+    }
 
     setStatus('loading')
 
@@ -81,29 +94,6 @@ export default function Booking() {
     const isEmailConfigured = EMAILJS_CONFIG.SERVICE_ID !== 'YOUR_SERVICE_ID'
 
     try {
-      // ── Firestore : transaction atomique anti-double réservation ──
-      if (isFirebaseConfigured && db) {
-        const bookingRef = doc(
-          db,
-          'bookings',
-          `${form.date}_court${selectedCourt}_${selectedTime.replace(':', '')}`,
-        )
-        await runTransaction(db, async (transaction) => {
-          const existing = await transaction.get(bookingRef)
-          if (existing.exists()) throw new Error('SLOT_TAKEN')
-          transaction.set(bookingRef, {
-            date:        form.date,
-            time:        selectedTime,
-            courtId:     selectedCourt,
-            courtName,
-            clientName:  form.name,
-            clientPhone: form.phone,
-            createdAt:   new Date().toISOString(),
-          })
-        })
-      }
-
-      // ── Email ──
       if (isEmailConfigured) {
         await emailjs.send(
           EMAILJS_CONFIG.SERVICE_ID,
@@ -116,8 +106,11 @@ export default function Booking() {
         console.log('📧 [DEV] Réservation simulée:', templateParams)
       }
 
+      // Save to localStorage after successful email
+      addBookedSlot(form.date, selectedCourt, selectedTime)
+      setBookedSlots(getBookedSlots(form.date, selectedCourt))
+
       setStatus('success')
-      setBookedSlots(prev => [...prev, selectedTime])
       setTimeout(() => {
         setStatus('idle')
         setForm({ date: '', name: '', phone: '' })
@@ -125,18 +118,10 @@ export default function Booking() {
         setSelectedCourt(0)
         setBookedSlots([])
       }, 6000)
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : ''
-      if (msg === 'SLOT_TAKEN') {
-        setBookedSlots(prev => [...prev, selectedTime])
-        setSelectedTime('')
-        setStatus('taken')
-        setTimeout(() => setStatus('idle'), 5000)
-      } else {
-        console.error('Booking error:', err)
-        setStatus('error')
-        setTimeout(() => setStatus('idle'), 5000)
-      }
+    } catch (err) {
+      console.error('Booking error:', err)
+      setStatus('error')
+      setTimeout(() => setStatus('idle'), 5000)
     }
   }
 
@@ -216,7 +201,7 @@ export default function Booking() {
                     </div>
                     <h3 className="text-xl font-black text-navy mb-2">Créneau déjà réservé</h3>
                     <p className="text-gray-500 text-sm">
-                      Ce créneau vient d'être pris. Choisissez un autre horaire.
+                      Ce créneau est déjà pris. Choisissez un autre horaire.
                     </p>
                   </motion.div>
                 )}
@@ -296,11 +281,6 @@ export default function Booking() {
                     <div className="mb-6">
                       <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">
                         <Clock size={12} className="text-primary" /> Heure
-                        {loadingSlots && (
-                          <span className="flex items-center gap-1 text-gray-400 font-normal normal-case tracking-normal ml-1">
-                            <Loader2 size={11} className="animate-spin" /> Vérification…
-                          </span>
-                        )}
                       </label>
                       <div className="grid grid-cols-5 gap-2">
                         {timeSlots.map(t => {
