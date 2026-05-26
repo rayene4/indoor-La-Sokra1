@@ -1,12 +1,14 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { CalendarDays, Clock, User, Phone, CheckCircle, AlertCircle, Banknote, Loader2 } from 'lucide-react'
 import emailjs from '@emailjs/browser'
+import { collection, doc, getDocs, query, runTransaction, where } from 'firebase/firestore'
 import { EMAILJS_CONFIG } from '../../emailjs.config'
+import { db, isFirebaseConfigured } from '../../firebase'
 
 const timeSlots = [
   '09:00','10:30','12:00','13:30','15:00',
-  '16:30','18:00','19:30','21:00','21:30','23:00',
+  '16:30','18:00','19:30','21:00','21:30',
 ]
 
 const courts = [
@@ -14,15 +16,46 @@ const courts = [
   { id: 2, name: 'Terrain 2' },
 ]
 
-type Status = 'idle' | 'loading' | 'success' | 'error'
+type Status = 'idle' | 'loading' | 'success' | 'error' | 'taken'
 
 export default function Booking() {
   const [selectedTime, setSelectedTime] = useState('')
   const [selectedCourt, setSelectedCourt] = useState(0)
   const [form, setForm] = useState({ date: '', name: '', phone: '' })
   const [status, setStatus] = useState<Status>('idle')
+  const [bookedSlots, setBookedSlots] = useState<string[]>([])
+  const [loadingSlots, setLoadingSlots] = useState(false)
 
   const isFormValid = form.name && form.phone && form.date && selectedTime && selectedCourt
+
+  // Fetch booked slots whenever date or court changes
+  useEffect(() => {
+    if (!form.date || !selectedCourt || !isFirebaseConfigured || !db) {
+      setBookedSlots([])
+      return
+    }
+
+    const fetchBookedSlots = async () => {
+      setLoadingSlots(true)
+      try {
+        const q = query(
+          collection(db!, 'bookings'),
+          where('date', '==', form.date),
+          where('courtId', '==', selectedCourt),
+        )
+        const snapshot = await getDocs(q)
+        const booked = snapshot.docs.map(d => d.data().time as string)
+        setBookedSlots(booked)
+        if (booked.includes(selectedTime)) setSelectedTime('')
+      } catch (err) {
+        console.error('Firestore fetch error:', err)
+      } finally {
+        setLoadingSlots(false)
+      }
+    }
+
+    fetchBookedSlots()
+  }, [form.date, selectedCourt])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -45,10 +78,33 @@ export default function Booking() {
       court_name:   courtName,
     }
 
-    const isConfigured = EMAILJS_CONFIG.SERVICE_ID !== 'YOUR_SERVICE_ID'
+    const isEmailConfigured = EMAILJS_CONFIG.SERVICE_ID !== 'YOUR_SERVICE_ID'
 
     try {
-      if (isConfigured) {
+      // ── Firestore : transaction atomique anti-double réservation ──
+      if (isFirebaseConfigured && db) {
+        const bookingRef = doc(
+          db,
+          'bookings',
+          `${form.date}_court${selectedCourt}_${selectedTime.replace(':', '')}`,
+        )
+        await runTransaction(db, async (transaction) => {
+          const existing = await transaction.get(bookingRef)
+          if (existing.exists()) throw new Error('SLOT_TAKEN')
+          transaction.set(bookingRef, {
+            date:        form.date,
+            time:        selectedTime,
+            courtId:     selectedCourt,
+            courtName,
+            clientName:  form.name,
+            clientPhone: form.phone,
+            createdAt:   new Date().toISOString(),
+          })
+        })
+      }
+
+      // ── Email ──
+      if (isEmailConfigured) {
         await emailjs.send(
           EMAILJS_CONFIG.SERVICE_ID,
           EMAILJS_CONFIG.TEMPLATE_ID,
@@ -59,17 +115,28 @@ export default function Booking() {
         await new Promise(r => setTimeout(r, 1200))
         console.log('📧 [DEV] Réservation simulée:', templateParams)
       }
+
       setStatus('success')
+      setBookedSlots(prev => [...prev, selectedTime])
       setTimeout(() => {
         setStatus('idle')
         setForm({ date: '', name: '', phone: '' })
         setSelectedTime('')
         setSelectedCourt(0)
+        setBookedSlots([])
       }, 6000)
-    } catch (err) {
-      console.error('EmailJS error:', err)
-      setStatus('error')
-      setTimeout(() => setStatus('idle'), 5000)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : ''
+      if (msg === 'SLOT_TAKEN') {
+        setBookedSlots(prev => [...prev, selectedTime])
+        setSelectedTime('')
+        setStatus('taken')
+        setTimeout(() => setStatus('idle'), 5000)
+      } else {
+        console.error('Booking error:', err)
+        setStatus('error')
+        setTimeout(() => setStatus('idle'), 5000)
+      }
     }
   }
 
@@ -114,6 +181,7 @@ export default function Booking() {
               className="bg-white rounded-3xl shadow-card border border-gray-100 p-8"
             >
               <AnimatePresence mode="wait">
+
                 {/* SUCCESS */}
                 {status === 'success' && (
                   <motion.div
@@ -126,10 +194,29 @@ export default function Booking() {
                     <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4">
                       <CheckCircle size={32} className="text-green-500" />
                     </div>
-                    <h3 className="text-xl font-black text-navy mb-2">Réservation envoyée !</h3>
+                    <h3 className="text-xl font-black text-navy mb-2">Réservation confirmée !</h3>
                     <p className="text-gray-500 text-sm max-w-xs">
                       Un email de confirmation a été envoyé au club.
                       Nous vous contacterons au <strong>{form.phone}</strong>.
+                    </p>
+                  </motion.div>
+                )}
+
+                {/* SLOT TAKEN */}
+                {status === 'taken' && (
+                  <motion.div
+                    key="taken"
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="flex flex-col items-center justify-center text-center py-12"
+                  >
+                    <div className="w-16 h-16 bg-orange-100 rounded-full flex items-center justify-center mb-4">
+                      <AlertCircle size={32} className="text-orange-500" />
+                    </div>
+                    <h3 className="text-xl font-black text-navy mb-2">Créneau déjà réservé</h3>
+                    <p className="text-gray-500 text-sm">
+                      Ce créneau vient d'être pris. Choisissez un autre horaire.
                     </p>
                   </motion.div>
                 )}
@@ -148,7 +235,7 @@ export default function Booking() {
                     </div>
                     <h3 className="text-xl font-black text-navy mb-2">Erreur d'envoi</h3>
                     <p className="text-gray-500 text-sm mb-4">
-                      Réservez directement par téléphone ou WhatsApp.
+                      Réservez directement par téléphone.
                     </p>
                     <a href="tel:24722000" className="btn-primary text-sm py-2.5">
                       Appeler le 24 722 000
@@ -209,23 +296,45 @@ export default function Booking() {
                     <div className="mb-6">
                       <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">
                         <Clock size={12} className="text-primary" /> Heure
+                        {loadingSlots && (
+                          <span className="flex items-center gap-1 text-gray-400 font-normal normal-case tracking-normal ml-1">
+                            <Loader2 size={11} className="animate-spin" /> Vérification…
+                          </span>
+                        )}
                       </label>
                       <div className="grid grid-cols-5 gap-2">
-                        {timeSlots.map(t => (
-                          <button
-                            type="button"
-                            key={t}
-                            onClick={() => setSelectedTime(t)}
-                            className={`py-2 rounded-xl text-xs font-semibold transition-all duration-150 ${
-                              selectedTime === t
-                                ? 'bg-primary text-white shadow-blue'
-                                : 'bg-gray-50 border border-gray-200 text-gray-600 hover:border-primary hover:text-primary'
-                            }`}
-                          >
-                            {t}
-                          </button>
-                        ))}
+                        {timeSlots.map(t => {
+                          const isBooked = bookedSlots.includes(t)
+                          const isSelected = selectedTime === t
+                          return (
+                            <button
+                              type="button"
+                              key={t}
+                              onClick={() => !isBooked && setSelectedTime(t)}
+                              disabled={isBooked}
+                              title={isBooked ? 'Créneau indisponible' : undefined}
+                              className={`py-2 rounded-xl text-xs font-semibold transition-all duration-150 relative ${
+                                isBooked
+                                  ? 'bg-gray-100 border border-gray-200 text-gray-300 cursor-not-allowed line-through'
+                                  : isSelected
+                                  ? 'bg-primary text-white shadow-blue'
+                                  : 'bg-gray-50 border border-gray-200 text-gray-600 hover:border-primary hover:text-primary'
+                              }`}
+                            >
+                              {t}
+                              {isBooked && (
+                                <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-400 rounded-full border border-white" />
+                              )}
+                            </button>
+                          )
+                        })}
                       </div>
+                      {bookedSlots.length > 0 && (
+                        <p className="text-xs text-gray-400 mt-2 flex items-center gap-1.5">
+                          <span className="w-2 h-2 bg-red-400 rounded-full inline-block flex-shrink-0" />
+                          Les créneaux barrés sont déjà réservés
+                        </p>
+                      )}
                     </div>
 
                     {/* Courts */}
