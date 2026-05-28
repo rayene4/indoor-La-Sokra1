@@ -26,8 +26,8 @@
  */
 
 export const SUPABASE_CONFIG = {
-  URL:      'YOUR_SUPABASE_URL',   // https://xxxx.supabase.co
-  ANON_KEY: 'YOUR_ANON_KEY',       // eyJhbGciOiJIUzI1...
+  URL:      'https://zmaqkthsyukgmceafvos.supabase.co',
+  ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptYXFrdGhzeXVrZ21jZWFmdm9zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NjY3MzUsImV4cCI6MjA5NTU0MjczNX0.HNArdjAPQs0bCl4U4JV8PsUflKOANGjsXd26e2aFlzo',       // eyJhbGciOiJIUzI1...
 }
 
 export const isSupabaseConfigured = SUPABASE_CONFIG.URL !== 'YOUR_SUPABASE_URL'
