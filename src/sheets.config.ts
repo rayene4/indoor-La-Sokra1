@@ -12,7 +12,7 @@
  */
 
 export const SHEETS_CONFIG = {
-  SCRIPT_URL: 'YOUR_SCRIPT_URL', // https://script.google.com/macros/s/.../exec
+  SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbxNCp2PF4BrhNXZqcNclVNei6yL927-yaKZlrbsdWnbO7QGC6IFtVBRtXMImseajQWa/exec', 
 }
 
 export const isSheetsConfigured = SHEETS_CONFIG.SCRIPT_URL !== 'YOUR_SCRIPT_URL'

@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { CalendarDays, Clock, User, Phone, CheckCircle, AlertCircle, Banknote, Loader2 } from 'lucide-react'
 import emailjs from '@emailjs/browser'
+import * as XLSX from 'xlsx'
 import { EMAILJS_CONFIG } from '../../emailjs.config'
-import { SHEETS_CONFIG, isSheetsConfigured } from '../../sheets.config'
 
 const timeSlots = [
   '09:00','10:30','12:00','13:30','15:00',
@@ -17,29 +17,7 @@ const courts = [
 
 type Status = 'idle' | 'loading' | 'success' | 'error' | 'taken'
 
-// ── Google Sheets ─────────────────────────────────────────────────────────────
-async function sheetsGetBooked(date: string, courtId: number): Promise<string[]> {
-  const url = `${SHEETS_CONFIG.SCRIPT_URL}?action=getBookings&date=${encodeURIComponent(date)}&courtId=${courtId}`
-  const res = await fetch(url)
-  const data = await res.json()
-  return Array.isArray(data.times) ? (data.times as string[]) : []
-}
-
-async function sheetsSave(p: {
-  date: string; time: string; courtId: number; courtName: string
-  clientName: string; clientPhone: string
-}): Promise<'ok' | 'taken'> {
-  const q = new URLSearchParams({
-    action: 'book', date: p.date, time: p.time,
-    courtId: String(p.courtId), courtName: p.courtName,
-    clientName: p.clientName, clientPhone: p.clientPhone,
-  })
-  const res = await fetch(`${SHEETS_CONFIG.SCRIPT_URL}?${q}`)
-  const data = await res.json()
-  return data.error === 'SLOT_TAKEN' ? 'taken' : 'ok'
-}
-
-// ── LocalStorage fallback ────────────────────────────────────────────────────
+// ── LocalStorage ──────────────────────────────────────────────────────────────
 const lsKey = (date: string, courtId: number) => `padel_${date}_c${courtId}`
 function lsGet(date: string, courtId: number): string[] {
   try { return JSON.parse(localStorage.getItem(lsKey(date, courtId)) ?? '[]') } catch { return [] }
@@ -47,6 +25,32 @@ function lsGet(date: string, courtId: number): string[] {
 function lsAdd(date: string, courtId: number, time: string) {
   const list = lsGet(date, courtId)
   if (!list.includes(time)) localStorage.setItem(lsKey(date, courtId), JSON.stringify([...list, time]))
+}
+
+// ── Excel export ──────────────────────────────────────────────────────────────
+const LS_ALL_KEY = 'padel_all_bookings'
+
+function getAllBookings(): object[] {
+  try { return JSON.parse(localStorage.getItem(LS_ALL_KEY) ?? '[]') } catch { return [] }
+}
+
+function saveBookingRecord(record: object) {
+  const all = getAllBookings()
+  all.push(record)
+  localStorage.setItem(LS_ALL_KEY, JSON.stringify(all))
+}
+
+function exportToExcel() {
+  const all = getAllBookings()
+  if (all.length === 0) return
+
+  const ws = XLSX.utils.json_to_sheet(all)
+  ws['!cols'] = [
+    { wch: 14 }, { wch: 10 }, { wch: 12 }, { wch: 22 }, { wch: 18 }, { wch: 18 },
+  ]
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'Réservations')
+  XLSX.writeFile(wb, `reservations_padel_${new Date().toISOString().split('T')[0]}.xlsx`)
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -56,49 +60,34 @@ export default function Booking() {
   const [form, setForm] = useState({ date: '', name: '', phone: '' })
   const [status, setStatus] = useState<Status>('idle')
   const [bookedSlots, setBookedSlots] = useState<string[]>([])
-  const [loadingSlots, setLoadingSlots] = useState(false)
-  const abortRef = useRef<AbortController | null>(null)
+  const [totalBookings, setTotalBookings] = useState(0)
 
   const isFormValid = form.name && form.phone && form.date && selectedTime && selectedCourt
 
-  // Load booked slots when date or court changes
   useEffect(() => {
-    abortRef.current?.abort()
-    const controller = new AbortController()
-    abortRef.current = controller
+    setTotalBookings(getAllBookings().length)
+  }, [])
 
-    async function load() {
-      if (!form.date || !selectedCourt) {
-        setBookedSlots([])
-        return
-      }
-      if (isSheetsConfigured) {
-        setLoadingSlots(true)
-        try {
-          const booked = await sheetsGetBooked(form.date, selectedCourt)
-          if (!controller.signal.aborted) {
-            setBookedSlots(booked)
-            setSelectedTime(t => booked.includes(t) ? '' : t)
-          }
-        } catch {
-          // ignore fetch errors, fall through to localStorage
-        } finally {
-          if (!controller.signal.aborted) setLoadingSlots(false)
-        }
-      } else {
-        const booked = lsGet(form.date, selectedCourt)
-        setBookedSlots(booked)
-        setSelectedTime(t => booked.includes(t) ? '' : t)
-      }
-    }
-
-    load()
-    return () => controller.abort()
+  useEffect(() => {
+    if (!form.date || !selectedCourt) { setBookedSlots([]); return }
+    const booked = lsGet(form.date, selectedCourt)
+    setBookedSlots(booked)
+    setSelectedTime(t => booked.includes(t) ? '' : t)
   }, [form.date, selectedCourt])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!isFormValid) return
+
+    // Check slot still available
+    if (lsGet(form.date, selectedCourt).includes(selectedTime)) {
+      setBookedSlots(lsGet(form.date, selectedCourt))
+      setSelectedTime('')
+      setStatus('taken')
+      setTimeout(() => setStatus('idle'), 5000)
+      return
+    }
+
     setStatus('loading')
 
     const courtName = courts.find(c => c.id === selectedCourt)?.name ?? ''
@@ -107,33 +96,7 @@ export default function Booking() {
     })
 
     try {
-      // ── Save booking ──
-      if (isSheetsConfigured) {
-        const result = await sheetsSave({
-          date: form.date, time: selectedTime, courtId: selectedCourt,
-          courtName, clientName: form.name, clientPhone: form.phone,
-        })
-        if (result === 'taken') {
-          setBookedSlots(prev => [...prev, selectedTime])
-          setSelectedTime('')
-          setStatus('taken')
-          setTimeout(() => setStatus('idle'), 5000)
-          return
-        }
-      } else {
-        // Check locally before saving
-        if (lsGet(form.date, selectedCourt).includes(selectedTime)) {
-          setBookedSlots(lsGet(form.date, selectedCourt))
-          setSelectedTime('')
-          setStatus('taken')
-          setTimeout(() => setStatus('idle'), 5000)
-          return
-        }
-        lsAdd(form.date, selectedCourt, selectedTime)
-        setBookedSlots(lsGet(form.date, selectedCourt))
-      }
-
-      // ── Send email ──
+      // ── Email ──
       if (EMAILJS_CONFIG.SERVICE_ID !== 'YOUR_SERVICE_ID') {
         await emailjs.send(
           EMAILJS_CONFIG.SERVICE_ID,
@@ -148,8 +111,25 @@ export default function Booking() {
         )
       } else {
         await new Promise(r => setTimeout(r, 1200))
-        console.log('📧 [DEV] Réservation simulée')
       }
+
+      // ── Save to localStorage + Excel record ──
+      lsAdd(form.date, selectedCourt, selectedTime)
+      setBookedSlots(lsGet(form.date, selectedCourt))
+
+      const record = {
+        Date:      form.date,
+        Heure:     selectedTime,
+        Terrain:   courtName,
+        Nom:       form.name,
+        Telephone: form.phone,
+        'Créé le': new Date().toLocaleString('fr-TN'),
+      }
+      saveBookingRecord(record)
+      setTotalBookings(getAllBookings().length)
+
+      // ── Auto-download Excel ──
+      exportToExcel()
 
       setStatus('success')
       setTimeout(() => {
@@ -214,7 +194,7 @@ export default function Booking() {
                     </div>
                     <h3 className="text-xl font-black text-navy mb-2">Réservation confirmée !</h3>
                     <p className="text-gray-500 text-sm max-w-xs">
-                      Un email a été envoyé au club. Nous vous contacterons au <strong>{form.phone}</strong>.
+                      Email envoyé au club. Nous vous contacterons au <strong>{form.phone}</strong>.
                     </p>
                   </motion.div>
                 )}
@@ -277,11 +257,6 @@ export default function Booking() {
                     <div className="mb-6">
                       <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">
                         <Clock size={12} className="text-primary" /> Heure
-                        {loadingSlots && (
-                          <span className="flex items-center gap-1 text-gray-400 font-normal normal-case tracking-normal ml-1">
-                            <Loader2 size={11} className="animate-spin" /> Vérification…
-                          </span>
-                        )}
                       </label>
                       <div className="grid grid-cols-5 gap-2">
                         {timeSlots.map(t => {
@@ -364,6 +339,7 @@ export default function Booking() {
           {/* ── SIDEBAR ── */}
           <motion.div className="lg:col-span-2 space-y-5"
             initial={{ opacity: 0, x: 24 }} whileInView={{ opacity: 1, x: 0 }} viewport={{ once: true }}>
+
             <div className="bg-primary rounded-2xl p-6 text-white shadow-blue-lg">
               <div className="text-white/60 text-xs uppercase tracking-wider mb-1">Tarif unique</div>
               <div className="text-5xl font-black">100</div>
@@ -372,6 +348,7 @@ export default function Booking() {
                 Accès illimité au terrain. Aucun frais supplémentaire.
               </div>
             </div>
+
             <div className="bg-white rounded-2xl p-5 shadow-card border border-gray-100">
               <h4 className="font-bold text-navy text-sm mb-3 flex items-center gap-2">
                 <Clock size={14} className="text-primary" /> Horaires
@@ -385,6 +362,7 @@ export default function Booking() {
                 ))}
               </div>
             </div>
+
             <div className="bg-white rounded-2xl p-5 shadow-card border border-gray-100">
               <h4 className="font-bold text-navy text-sm mb-3">Réserver par téléphone</h4>
               <a href="tel:24722000" className="flex items-center gap-3 p-3 bg-primary-bg rounded-xl hover:bg-primary-border/30 transition-colors">
@@ -392,6 +370,23 @@ export default function Booking() {
                 <span className="font-bold text-primary">24 722 000</span>
               </a>
             </div>
+
+            {/* Export Excel */}
+            {totalBookings > 0 && (
+              <button
+                onClick={exportToExcel}
+                className="w-full flex items-center justify-between gap-3 bg-green-50 border border-green-200 rounded-2xl p-4 hover:bg-green-100 transition-colors group"
+              >
+                <div className="text-left">
+                  <div className="font-bold text-green-800 text-sm">Exporter les réservations</div>
+                  <div className="text-green-600 text-xs">{totalBookings} réservation{totalBookings > 1 ? 's' : ''} · fichier .xlsx</div>
+                </div>
+                <svg className="w-5 h-5 text-green-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+              </button>
+            )}
+
             <div className="bg-navy/5 border border-navy/10 rounded-2xl p-4 text-xs text-gray-500 leading-relaxed">
               📧 Un email de confirmation est automatiquement envoyé au club à chaque réservation.
             </div>
