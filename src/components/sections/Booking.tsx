@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { CalendarDays, Clock, User, Phone, CheckCircle, AlertCircle, Banknote, Loader2 } from 'lucide-react'
 import emailjs from '@emailjs/browser'
 import { EMAILJS_CONFIG } from '../../emailjs.config'
+import { SHEETS_CONFIG, isSheetsConfigured } from '../../sheets.config'
 
 const timeSlots = [
   '09:00','10:30','12:00','13:30','15:00',
@@ -16,28 +17,36 @@ const courts = [
 
 type Status = 'idle' | 'loading' | 'success' | 'error' | 'taken'
 
-// ── LocalStorage helpers ──────────────────────────────────────────────────────
-const storageKey = (date: string, courtId: number) =>
-  `padel_bookings_${date}_court${courtId}`
-
-function getBookedSlots(date: string, courtId: number): string[] {
-  try {
-    const raw = localStorage.getItem(storageKey(date, courtId))
-    return raw ? (JSON.parse(raw) as string[]) : []
-  } catch {
-    return []
-  }
+// ── Google Sheets ─────────────────────────────────────────────────────────────
+async function sheetsGetBooked(date: string, courtId: number): Promise<string[]> {
+  const url = `${SHEETS_CONFIG.SCRIPT_URL}?action=getBookings&date=${encodeURIComponent(date)}&courtId=${courtId}`
+  const res = await fetch(url)
+  const data = await res.json()
+  return Array.isArray(data.times) ? (data.times as string[]) : []
 }
 
-function addBookedSlot(date: string, courtId: number, time: string): void {
-  const existing = getBookedSlots(date, courtId)
-  if (!existing.includes(time)) {
-    localStorage.setItem(storageKey(date, courtId), JSON.stringify([...existing, time]))
-  }
+async function sheetsSave(p: {
+  date: string; time: string; courtId: number; courtName: string
+  clientName: string; clientPhone: string
+}): Promise<'ok' | 'taken'> {
+  const q = new URLSearchParams({
+    action: 'book', date: p.date, time: p.time,
+    courtId: String(p.courtId), courtName: p.courtName,
+    clientName: p.clientName, clientPhone: p.clientPhone,
+  })
+  const res = await fetch(`${SHEETS_CONFIG.SCRIPT_URL}?${q}`)
+  const data = await res.json()
+  return data.error === 'SLOT_TAKEN' ? 'taken' : 'ok'
 }
 
-function isSlotTaken(date: string, courtId: number, time: string): boolean {
-  return getBookedSlots(date, courtId).includes(time)
+// ── LocalStorage fallback ────────────────────────────────────────────────────
+const lsKey = (date: string, courtId: number) => `padel_${date}_c${courtId}`
+function lsGet(date: string, courtId: number): string[] {
+  try { return JSON.parse(localStorage.getItem(lsKey(date, courtId)) ?? '[]') } catch { return [] }
+}
+function lsAdd(date: string, courtId: number, time: string) {
+  const list = lsGet(date, courtId)
+  if (!list.includes(time)) localStorage.setItem(lsKey(date, courtId), JSON.stringify([...list, time]))
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -47,68 +56,100 @@ export default function Booking() {
   const [form, setForm] = useState({ date: '', name: '', phone: '' })
   const [status, setStatus] = useState<Status>('idle')
   const [bookedSlots, setBookedSlots] = useState<string[]>([])
+  const [loadingSlots, setLoadingSlots] = useState(false)
+  const abortRef = useRef<AbortController | null>(null)
 
   const isFormValid = form.name && form.phone && form.date && selectedTime && selectedCourt
 
-  // Reload booked slots from localStorage when date or court changes
+  // Load booked slots when date or court changes
   useEffect(() => {
-    if (!form.date || !selectedCourt) {
-      setBookedSlots([])
-      return
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    async function load() {
+      if (!form.date || !selectedCourt) {
+        setBookedSlots([])
+        return
+      }
+      if (isSheetsConfigured) {
+        setLoadingSlots(true)
+        try {
+          const booked = await sheetsGetBooked(form.date, selectedCourt)
+          if (!controller.signal.aborted) {
+            setBookedSlots(booked)
+            setSelectedTime(t => booked.includes(t) ? '' : t)
+          }
+        } catch {
+          // ignore fetch errors, fall through to localStorage
+        } finally {
+          if (!controller.signal.aborted) setLoadingSlots(false)
+        }
+      } else {
+        const booked = lsGet(form.date, selectedCourt)
+        setBookedSlots(booked)
+        setSelectedTime(t => booked.includes(t) ? '' : t)
+      }
     }
-    const booked = getBookedSlots(form.date, selectedCourt)
-    setBookedSlots(booked)
-    if (booked.includes(selectedTime)) setSelectedTime('')
+
+    load()
+    return () => controller.abort()
   }, [form.date, selectedCourt])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!isFormValid) return
-
-    // Double-check slot availability right before submitting
-    if (isSlotTaken(form.date, selectedCourt, selectedTime)) {
-      setBookedSlots(getBookedSlots(form.date, selectedCourt))
-      setSelectedTime('')
-      setStatus('taken')
-      setTimeout(() => setStatus('idle'), 5000)
-      return
-    }
-
     setStatus('loading')
 
     const courtName = courts.find(c => c.id === selectedCourt)?.name ?? ''
-    const dateObj = new Date(form.date)
-    const formattedDate = dateObj.toLocaleDateString('fr-TN', {
+    const formattedDate = new Date(form.date).toLocaleDateString('fr-TN', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     })
 
-    const templateParams = {
-      to_email:     EMAILJS_CONFIG.ADMIN_EMAIL,
-      client_name:  form.name,
-      client_phone: form.phone,
-      booking_date: formattedDate,
-      booking_time: selectedTime,
-      court_name:   courtName,
-    }
-
-    const isEmailConfigured = EMAILJS_CONFIG.SERVICE_ID !== 'YOUR_SERVICE_ID'
-
     try {
-      if (isEmailConfigured) {
+      // ── Save booking ──
+      if (isSheetsConfigured) {
+        const result = await sheetsSave({
+          date: form.date, time: selectedTime, courtId: selectedCourt,
+          courtName, clientName: form.name, clientPhone: form.phone,
+        })
+        if (result === 'taken') {
+          setBookedSlots(prev => [...prev, selectedTime])
+          setSelectedTime('')
+          setStatus('taken')
+          setTimeout(() => setStatus('idle'), 5000)
+          return
+        }
+      } else {
+        // Check locally before saving
+        if (lsGet(form.date, selectedCourt).includes(selectedTime)) {
+          setBookedSlots(lsGet(form.date, selectedCourt))
+          setSelectedTime('')
+          setStatus('taken')
+          setTimeout(() => setStatus('idle'), 5000)
+          return
+        }
+        lsAdd(form.date, selectedCourt, selectedTime)
+        setBookedSlots(lsGet(form.date, selectedCourt))
+      }
+
+      // ── Send email ──
+      if (EMAILJS_CONFIG.SERVICE_ID !== 'YOUR_SERVICE_ID') {
         await emailjs.send(
           EMAILJS_CONFIG.SERVICE_ID,
           EMAILJS_CONFIG.TEMPLATE_ID,
-          templateParams,
+          {
+            to_email: EMAILJS_CONFIG.ADMIN_EMAIL,
+            client_name: form.name, client_phone: form.phone,
+            booking_date: formattedDate, booking_time: selectedTime,
+            court_name: courtName,
+          },
           EMAILJS_CONFIG.PUBLIC_KEY,
         )
       } else {
         await new Promise(r => setTimeout(r, 1200))
-        console.log('📧 [DEV] Réservation simulée:', templateParams)
+        console.log('📧 [DEV] Réservation simulée')
       }
-
-      // Save to localStorage after successful email
-      addBookedSlot(form.date, selectedCourt, selectedTime)
-      setBookedSlots(getBookedSlots(form.date, selectedCourt))
 
       setStatus('success')
       setTimeout(() => {
@@ -140,8 +181,6 @@ export default function Booking() {
           <p className="text-gray-500 text-lg max-w-xl mx-auto">
             Choisissez votre créneau et confirmez en quelques secondes
           </p>
-
-          {/* Price badge */}
           <div className="inline-flex items-center gap-3 bg-white border border-primary/20 shadow-blue rounded-2xl px-6 py-3 mt-6">
             <Banknote size={22} className="text-primary" />
             <div className="text-left">
@@ -167,68 +206,42 @@ export default function Booking() {
             >
               <AnimatePresence mode="wait">
 
-                {/* SUCCESS */}
                 {status === 'success' && (
-                  <motion.div
-                    key="success"
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="flex flex-col items-center justify-center text-center py-12"
-                  >
+                  <motion.div key="success" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}
+                    className="flex flex-col items-center justify-center text-center py-12">
                     <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4">
                       <CheckCircle size={32} className="text-green-500" />
                     </div>
                     <h3 className="text-xl font-black text-navy mb-2">Réservation confirmée !</h3>
                     <p className="text-gray-500 text-sm max-w-xs">
-                      Un email de confirmation a été envoyé au club.
-                      Nous vous contacterons au <strong>{form.phone}</strong>.
+                      Un email a été envoyé au club. Nous vous contacterons au <strong>{form.phone}</strong>.
                     </p>
                   </motion.div>
                 )}
 
-                {/* SLOT TAKEN */}
                 {status === 'taken' && (
-                  <motion.div
-                    key="taken"
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="flex flex-col items-center justify-center text-center py-12"
-                  >
+                  <motion.div key="taken" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}
+                    className="flex flex-col items-center justify-center text-center py-12">
                     <div className="w-16 h-16 bg-orange-100 rounded-full flex items-center justify-center mb-4">
                       <AlertCircle size={32} className="text-orange-500" />
                     </div>
                     <h3 className="text-xl font-black text-navy mb-2">Créneau déjà réservé</h3>
-                    <p className="text-gray-500 text-sm">
-                      Ce créneau est déjà pris. Choisissez un autre horaire.
-                    </p>
+                    <p className="text-gray-500 text-sm">Ce créneau est pris. Choisissez un autre horaire.</p>
                   </motion.div>
                 )}
 
-                {/* ERROR */}
                 {status === 'error' && (
-                  <motion.div
-                    key="error"
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="flex flex-col items-center justify-center text-center py-12"
-                  >
+                  <motion.div key="error" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}
+                    className="flex flex-col items-center justify-center text-center py-12">
                     <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mb-4">
                       <AlertCircle size={32} className="text-red-500" />
                     </div>
                     <h3 className="text-xl font-black text-navy mb-2">Erreur d'envoi</h3>
-                    <p className="text-gray-500 text-sm mb-4">
-                      Réservez directement par téléphone.
-                    </p>
-                    <a href="tel:24722000" className="btn-primary text-sm py-2.5">
-                      Appeler le 24 722 000
-                    </a>
+                    <p className="text-gray-500 text-sm mb-4">Réservez directement par téléphone.</p>
+                    <a href="tel:24722000" className="btn-primary text-sm py-2.5">Appeler le 24 722 000</a>
                   </motion.div>
                 )}
 
-                {/* FORM */}
                 {(status === 'idle' || status === 'loading') && (
                   <motion.div key="form" initial={{ opacity: 1 }} exit={{ opacity: 0 }}>
 
@@ -238,27 +251,15 @@ export default function Booking() {
                         <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
                           <User size={12} className="text-primary" /> Nom complet
                         </label>
-                        <input
-                          type="text"
-                          placeholder="Votre nom"
-                          value={form.name}
-                          onChange={e => setForm({ ...form, name: e.target.value })}
-                          required
-                          className="input"
-                        />
+                        <input type="text" placeholder="Votre nom" value={form.name}
+                          onChange={e => setForm({ ...form, name: e.target.value })} required className="input" />
                       </div>
                       <div>
                         <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
                           <Phone size={12} className="text-primary" /> Téléphone
                         </label>
-                        <input
-                          type="tel"
-                          placeholder="XX XXX XXX"
-                          value={form.phone}
-                          onChange={e => setForm({ ...form, phone: e.target.value })}
-                          required
-                          className="input"
-                        />
+                        <input type="tel" placeholder="XX XXX XXX" value={form.phone}
+                          onChange={e => setForm({ ...form, phone: e.target.value })} required className="input" />
                       </div>
                     </div>
 
@@ -267,29 +268,27 @@ export default function Booking() {
                       <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
                         <CalendarDays size={12} className="text-primary" /> Date
                       </label>
-                      <input
-                        type="date"
-                        value={form.date}
+                      <input type="date" value={form.date}
                         onChange={e => setForm({ ...form, date: e.target.value })}
-                        min={new Date().toISOString().split('T')[0]}
-                        required
-                        className="input"
-                      />
+                        min={new Date().toISOString().split('T')[0]} required className="input" />
                     </div>
 
                     {/* Time slots */}
                     <div className="mb-6">
                       <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">
                         <Clock size={12} className="text-primary" /> Heure
+                        {loadingSlots && (
+                          <span className="flex items-center gap-1 text-gray-400 font-normal normal-case tracking-normal ml-1">
+                            <Loader2 size={11} className="animate-spin" /> Vérification…
+                          </span>
+                        )}
                       </label>
                       <div className="grid grid-cols-5 gap-2">
                         {timeSlots.map(t => {
                           const isBooked = bookedSlots.includes(t)
                           const isSelected = selectedTime === t
                           return (
-                            <button
-                              type="button"
-                              key={t}
+                            <button type="button" key={t}
                               onClick={() => !isBooked && setSelectedTime(t)}
                               disabled={isBooked}
                               title={isBooked ? 'Créneau indisponible' : undefined}
@@ -319,19 +318,12 @@ export default function Booking() {
 
                     {/* Courts */}
                     <div className="mb-8">
-                      <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3 block">
-                        Terrain
-                      </label>
+                      <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3 block">Terrain</label>
                       <div className="grid grid-cols-2 gap-4">
                         {courts.map(c => (
-                          <button
-                            type="button"
-                            key={c.id}
-                            onClick={() => setSelectedCourt(c.id)}
+                          <button type="button" key={c.id} onClick={() => setSelectedCourt(c.id)}
                             className={`p-5 rounded-2xl border-2 text-center transition-all duration-150 ${
-                              selectedCourt === c.id
-                                ? 'border-primary bg-primary/5 shadow-blue'
-                                : 'border-gray-200 bg-white hover:border-primary/40'
+                              selectedCourt === c.id ? 'border-primary bg-primary/5 shadow-blue' : 'border-gray-200 bg-white hover:border-primary/40'
                             }`}
                           >
                             <div className={`w-10 h-10 rounded-xl mx-auto mb-2 flex items-center justify-center ${
@@ -343,9 +335,7 @@ export default function Booking() {
                                 <line x1="2" y1="12" x2="22" y2="12" stroke="currentColor" strokeWidth="1.5"/>
                               </svg>
                             </div>
-                            <div className={`font-bold text-sm ${selectedCourt === c.id ? 'text-primary' : 'text-navy'}`}>
-                              {c.name}
-                            </div>
+                            <div className={`font-bold text-sm ${selectedCourt === c.id ? 'text-primary' : 'text-navy'}`}>{c.name}</div>
                             <div className="text-gray-400 text-xs mt-0.5">Indoor · Verre panoramique</div>
                           </button>
                         ))}
@@ -353,30 +343,17 @@ export default function Booking() {
                     </div>
 
                     {/* Submit */}
-                    <button
-                      type="submit"
-                      disabled={!isFormValid || status === 'loading'}
-                      className={`btn-primary w-full justify-center text-base py-4 ${
-                        !isFormValid ? 'opacity-50 cursor-not-allowed' : ''
-                      }`}
+                    <button type="submit" disabled={!isFormValid || status === 'loading'}
+                      className={`btn-primary w-full justify-center text-base py-4 ${!isFormValid ? 'opacity-50 cursor-not-allowed' : ''}`}
                     >
                       {status === 'loading' ? (
-                        <>
-                          <Loader2 size={18} className="animate-spin" />
-                          Envoi en cours…
-                        </>
+                        <><Loader2 size={18} className="animate-spin" /> Envoi en cours…</>
                       ) : (
-                        <>
-                          <CalendarDays size={18} />
-                          Confirmer la réservation
-                        </>
+                        <><CalendarDays size={18} /> Confirmer la réservation</>
                       )}
                     </button>
-
                     {!isFormValid && (
-                      <p className="text-center text-xs text-gray-400 mt-3">
-                        Remplissez tous les champs pour continuer
-                      </p>
+                      <p className="text-center text-xs text-gray-400 mt-3">Remplissez tous les champs pour continuer</p>
                     )}
                   </motion.div>
                 )}
@@ -385,12 +362,8 @@ export default function Booking() {
           </motion.div>
 
           {/* ── SIDEBAR ── */}
-          <motion.div
-            className="lg:col-span-2 space-y-5"
-            initial={{ opacity: 0, x: 24 }}
-            whileInView={{ opacity: 1, x: 0 }}
-            viewport={{ once: true }}
-          >
+          <motion.div className="lg:col-span-2 space-y-5"
+            initial={{ opacity: 0, x: 24 }} whileInView={{ opacity: 1, x: 0 }} viewport={{ once: true }}>
             <div className="bg-primary rounded-2xl p-6 text-white shadow-blue-lg">
               <div className="text-white/60 text-xs uppercase tracking-wider mb-1">Tarif unique</div>
               <div className="text-5xl font-black">100</div>
@@ -399,7 +372,6 @@ export default function Booking() {
                 Accès illimité au terrain. Aucun frais supplémentaire.
               </div>
             </div>
-
             <div className="bg-white rounded-2xl p-5 shadow-card border border-gray-100">
               <h4 className="font-bold text-navy text-sm mb-3 flex items-center gap-2">
                 <Clock size={14} className="text-primary" /> Horaires
@@ -413,15 +385,13 @@ export default function Booking() {
                 ))}
               </div>
             </div>
-
             <div className="bg-white rounded-2xl p-5 shadow-card border border-gray-100">
               <h4 className="font-bold text-navy text-sm mb-3">Réserver par téléphone</h4>
-              <a href="tel:24722000" className="flex items-center gap-3 p-3 bg-primary-bg rounded-xl hover:bg-primary-border/30 transition-colors group">
+              <a href="tel:24722000" className="flex items-center gap-3 p-3 bg-primary-bg rounded-xl hover:bg-primary-border/30 transition-colors">
                 <Phone size={16} className="text-primary" />
                 <span className="font-bold text-primary">24 722 000</span>
               </a>
             </div>
-
             <div className="bg-navy/5 border border-navy/10 rounded-2xl p-4 text-xs text-gray-500 leading-relaxed">
               📧 Un email de confirmation est automatiquement envoyé au club à chaque réservation.
             </div>
