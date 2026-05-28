@@ -1,9 +1,26 @@
-import { useState, useMemo } from 'react'
+import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { CalendarDays, Clock, User, Phone, CheckCircle, AlertCircle, Banknote, Loader2 } from 'lucide-react'
+import { createClient } from '@supabase/supabase-js'
 import emailjs from '@emailjs/browser'
-import * as XLSX from 'xlsx'
 import { EMAILJS_CONFIG } from '../../emailjs.config'
+import { SUPABASE_CONFIG, isSupabaseConfigured } from '../../supabase.config'
+
+// ── Supabase client ───────────────────────────────────────────────────────────
+const supabase = isSupabaseConfigured
+  ? createClient(SUPABASE_CONFIG.URL, SUPABASE_CONFIG.ANON_KEY)
+  : null
+
+// ── LocalStorage fallback ────────────────────────────────────────────────────
+const lsKey = (date: string, courtId: number) => `padel_${date}_c${courtId}`
+function lsGet(date: string, courtId: number): string[] {
+  try { return JSON.parse(localStorage.getItem(lsKey(date, courtId)) ?? '[]') } catch { return [] }
+}
+function lsAdd(date: string, courtId: number, time: string) {
+  const list = lsGet(date, courtId)
+  if (!list.includes(time)) localStorage.setItem(lsKey(date, courtId), JSON.stringify([...list, time]))
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const timeSlots = [
   '09:00','10:30','12:00','13:30','15:00',
@@ -17,71 +34,50 @@ const courts = [
 
 type Status = 'idle' | 'loading' | 'success' | 'error' | 'taken'
 
-// ── LocalStorage ──────────────────────────────────────────────────────────────
-const lsKey = (date: string, courtId: number) => `padel_${date}_c${courtId}`
-function lsGet(date: string, courtId: number): string[] {
-  try { return JSON.parse(localStorage.getItem(lsKey(date, courtId)) ?? '[]') } catch { return [] }
-}
-function lsAdd(date: string, courtId: number, time: string) {
-  const list = lsGet(date, courtId)
-  if (!list.includes(time)) localStorage.setItem(lsKey(date, courtId), JSON.stringify([...list, time]))
-}
-
-// ── Excel export ──────────────────────────────────────────────────────────────
-const LS_ALL_KEY = 'padel_all_bookings'
-
-function getAllBookings(): object[] {
-  try { return JSON.parse(localStorage.getItem(LS_ALL_KEY) ?? '[]') } catch { return [] }
-}
-
-function saveBookingRecord(record: object) {
-  const all = getAllBookings()
-  all.push(record)
-  localStorage.setItem(LS_ALL_KEY, JSON.stringify(all))
-}
-
-function exportToExcel() {
-  const all = getAllBookings()
-  if (all.length === 0) return
-
-  const ws = XLSX.utils.json_to_sheet(all)
-  ws['!cols'] = [
-    { wch: 14 }, { wch: 10 }, { wch: 12 }, { wch: 22 }, { wch: 18 }, { wch: 18 },
-  ]
-  const wb = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(wb, ws, 'Réservations')
-  XLSX.writeFile(wb, `reservations_padel_${new Date().toISOString().split('T')[0]}.xlsx`)
-}
-// ─────────────────────────────────────────────────────────────────────────────
-
 export default function Booking() {
   const [selectedTime, setSelectedTime] = useState('')
   const [selectedCourt, setSelectedCourt] = useState(0)
   const [form, setForm] = useState({ date: '', name: '', phone: '' })
   const [status, setStatus] = useState<Status>('idle')
-  const [bookingVersion, setBookingVersion] = useState(0)
-
-  const bookedSlots = useMemo(
-    () => form.date && selectedCourt ? lsGet(form.date, selectedCourt) : [],
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [form.date, selectedCourt, bookingVersion]
-  )
+  const [bookedSlots, setBookedSlots] = useState<string[]>([])
+  const [loadingSlots, setLoadingSlots] = useState(false)
 
   const isFormValid =
     form.name && form.phone && form.date &&
     selectedTime && selectedCourt && !bookedSlots.includes(selectedTime)
 
+  // Load booked slots from Supabase (or localStorage)
+  useEffect(() => {
+    let cancelled = false
+
+    async function load() {
+      if (!form.date || !selectedCourt) {
+        setBookedSlots([])
+        return
+      }
+      if (isSupabaseConfigured && supabase) {
+        setLoadingSlots(true)
+        const { data } = await supabase
+          .from('bookings')
+          .select('time')
+          .eq('date', form.date)
+          .eq('court_id', selectedCourt)
+        if (!cancelled) {
+          setBookedSlots(data?.map(r => r.time as string) ?? [])
+          setLoadingSlots(false)
+        }
+      } else {
+        if (!cancelled) setBookedSlots(lsGet(form.date, selectedCourt))
+      }
+    }
+
+    load()
+    return () => { cancelled = true }
+  }, [form.date, selectedCourt])
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!isFormValid) return
-
-    if (lsGet(form.date, selectedCourt).includes(selectedTime)) {
-      setSelectedTime('')
-      setStatus('taken')
-      setTimeout(() => setStatus('idle'), 5000)
-      return
-    }
-
     setStatus('loading')
 
     const courtName = courts.find(c => c.id === selectedCourt)?.name ?? ''
@@ -90,6 +86,36 @@ export default function Booking() {
     })
 
     try {
+      // ── Save booking ──
+      if (isSupabaseConfigured && supabase) {
+        const id = `${form.date}_court${selectedCourt}_${selectedTime.replace(':', '')}`
+        const { error } = await supabase.from('bookings').insert({
+          id, date: form.date, time: selectedTime,
+          court_id: selectedCourt, court_name: courtName,
+          client_name: form.name, client_phone: form.phone,
+        })
+        if (error?.code === '23505') {
+          // Unique constraint violation = slot already taken
+          setBookedSlots(prev => [...prev, selectedTime])
+          setSelectedTime('')
+          setStatus('taken')
+          setTimeout(() => setStatus('idle'), 5000)
+          return
+        }
+        if (error) throw error
+        setBookedSlots(prev => [...prev, selectedTime])
+      } else {
+        if (lsGet(form.date, selectedCourt).includes(selectedTime)) {
+          setSelectedTime('')
+          setStatus('taken')
+          setTimeout(() => setStatus('idle'), 5000)
+          return
+        }
+        lsAdd(form.date, selectedCourt, selectedTime)
+        setBookedSlots(lsGet(form.date, selectedCourt))
+      }
+
+      // ── Send email ──
       if (EMAILJS_CONFIG.SERVICE_ID !== 'YOUR_SERVICE_ID') {
         await emailjs.send(
           EMAILJS_CONFIG.SERVICE_ID,
@@ -106,21 +132,13 @@ export default function Booking() {
         await new Promise(r => setTimeout(r, 1200))
       }
 
-      lsAdd(form.date, selectedCourt, selectedTime)
-      saveBookingRecord({
-        Date: form.date, Heure: selectedTime, Terrain: courtName,
-        Nom: form.name, Telephone: form.phone,
-        'Créé le': new Date().toLocaleString('fr-TN'),
-      })
-      exportToExcel()
-      setBookingVersion(v => v + 1)
-
       setStatus('success')
       setTimeout(() => {
         setStatus('idle')
         setForm({ date: '', name: '', phone: '' })
         setSelectedTime('')
         setSelectedCourt(0)
+        setBookedSlots([])
       }, 6000)
     } catch (err) {
       console.error('Booking error:', err)
@@ -240,6 +258,11 @@ export default function Booking() {
                     <div className="mb-6">
                       <label className="flex items-center gap-1.5 text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">
                         <Clock size={12} className="text-primary" /> Heure
+                        {loadingSlots && (
+                          <span className="flex items-center gap-1 text-gray-400 font-normal normal-case tracking-normal ml-1">
+                            <Loader2 size={11} className="animate-spin" /> Vérification…
+                          </span>
+                        )}
                       </label>
                       <div className="grid grid-cols-5 gap-2">
                         {timeSlots.map(t => {
@@ -337,7 +360,7 @@ export default function Booking() {
                 <Clock size={14} className="text-primary" /> Horaires
               </h4>
               <div className="space-y-2.5">
-                {[['Lundi – Dimanche', '08h00 – 23h00'], ['Jours fériés', '09h00 – 22h00']].map(([d, h]) => (
+                {[['Lundi – Dimanche', '09h00 – 00h30'], ['Jours fériés', '09h00 – 00h30']].map(([d, h]) => (
                   <div key={d} className="flex justify-between">
                     <span className="text-gray-500 text-sm">{d}</span>
                     <span className="font-semibold text-primary text-sm">{h}</span>
