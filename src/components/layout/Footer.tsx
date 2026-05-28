@@ -71,7 +71,7 @@ export default function Footer() {
             </div>
             <div className="mt-5 bg-white/5 border border-white/8 rounded-xl p-4">
               <div className="text-sky-300 font-bold text-sm">Ouvert 7j/7</div>
-              <div className="text-white font-black text-lg">08h00 – 23h00</div>
+              <div className="text-white font-black text-lg">09h00 – 00h30</div>
             </div>
           </div>
         </div>

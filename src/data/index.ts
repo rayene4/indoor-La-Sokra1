@@ -63,6 +63,6 @@ export const contactInfo = {
   address: 'V6CJ+P4H, La Soukra, Tunis, Tunisie',
   instagram: 'https://www.instagram.com/padelindoorlasoukra',
   facebook: 'https://www.facebook.com/padelindoorlasoukra',
-  hours: 'Lun – Dim : 08h00 – 23h00',
+  hours: 'Lun – Dim : 09h00 – 00h30',
   mapsEmbed: 'https://maps.google.com/maps?q=V6CJ%2BP4H+Tunis+Tunisia&z=17&output=embed',
 }

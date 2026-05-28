@@ -28,7 +28,7 @@ export default function Hero() {
             transition={{ duration: 0.5 }}
           >
             <span className="w-1.5 h-1.5 bg-sky-300 rounded-full animate-pulse" />
-            Ouvert 7j/7 · 08h00 – 23h00 · La Soukra, Tunis
+            Ouvert 7j/7 · 09h00 – 00h30 · La Soukra, Tunis
           </motion.div>
 
           {/* Headline */}
