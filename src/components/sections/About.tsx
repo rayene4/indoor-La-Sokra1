@@ -1,5 +1,5 @@
 import type { ElementType } from 'react'
-import { motion } from 'framer-motion'
+import { motion } from 'motion/react'
 import { Layers, Wind, ShowerHead, Car } from 'lucide-react'
 import { features } from '../../data'
 

@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion'
+import { motion } from 'motion/react'
 import { Share2, Star, Award } from 'lucide-react'
 import { coaches } from '../../data'
 

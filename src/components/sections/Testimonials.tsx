@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
+import { motion, AnimatePresence } from 'motion/react'
 import { Star, ChevronLeft, ChevronRight, Quote } from 'lucide-react'
 import { testimonials } from '../../data'
 

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { motion } from 'framer-motion'
+import { motion } from 'motion/react'
 import { Phone, MapPin, MessageCircle, Share2, Globe, Send, Clock } from 'lucide-react'
 import { contactInfo } from '../../data'
 
