@@ -7,15 +7,20 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "video": "npx remotion studio src/remotion/index.ts",
+    "render": "npx remotion render src/remotion/index.ts PadelPromo padel-promo.mp4"
   },
   "dependencies": {
     "@emailjs/browser": "^4.4.1",
+    "@remotion/bundler": "^4.0.469",
+    "@remotion/renderer": "^4.0.469",
     "@supabase/supabase-js": "^2.106.2",
     "lucide-react": "^1.16.0",
     "motion": "^12.40.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
+    "remotion": "^4.0.469",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
